@@ -9,7 +9,6 @@ import 'package:video_player/video_player.dart';
 import '../l10n/app_localizations.dart';
 import '../models/channel_model.dart';
 import '../models/match_model.dart';
-import '../services/fallback_streams.dart';
 import '../theme/app_colors.dart';
 
 /// Arguments required by the full-screen player.
@@ -80,9 +79,13 @@ class PlayerArgs {
     // Channel headers (User-Agent/Referer) are meant for the provider URL and
     // can break the public backup hosts, so backups are requested cleanly.
     if (isFallbackSource(index)) return const <String, String>{};
+    // Each mirror can require different request headers. Do not leak the
+    // primary mirror's Referer/User-Agent into a different provider.
+    if (index >= 0 && index < streamHeaders.length) {
+      return Map<String, String>.of(streamHeaders[index]);
+    }
     return <String, String>{
       ...httpHeaders,
-      if (index >= 0 && index < streamHeaders.length) ...streamHeaders[index],
     };
   }
 
@@ -109,7 +112,6 @@ class PlayerArgs {
       streamUrl: urls.isEmpty ? '' : urls.first,
       streamUrls: urls,
       streamHeaders: channel.streamHeaders,
-      fallbackUrls: FallbackStreams.urls,
       logoUrl: channel.logo,
       httpHeaders: headers,
       isLive: true,
@@ -135,7 +137,6 @@ class PlayerArgs {
           .join(' • '),
       streamUrl: urls.isEmpty ? '' : urls.first,
       streamUrls: urls,
-      fallbackUrls: FallbackStreams.urls,
       logoUrl: match.channelLogo,
       httpHeaders: match.httpHeaders,
       isLive: match.isLive,
@@ -260,16 +261,22 @@ class _PlayerScreenState extends State<PlayerScreen>
       final isValidUrl =
           uri != null &&
           uri.hasScheme &&
-          (uri.scheme == 'http' || uri.scheme == 'https');
+          (uri.scheme == 'http' || uri.scheme == 'https') &&
+          uri.host.isNotEmpty;
 
       if (!isValidUrl) continue;
 
+      final path = uri.path.toLowerCase();
+      VideoFormat? formatHint;
+      if (path.endsWith('.m3u8') || path.endsWith('.m3u')) {
+        formatHint = VideoFormat.hls;
+      } else if (path.endsWith('.mpd')) {
+        formatHint = VideoFormat.dash;
+      }
       final controller = VideoPlayerController.networkUrl(
         uri,
         httpHeaders: widget.args.headersForSource(index),
-        formatHint: uri.path.toLowerCase().endsWith('.m3u8')
-            ? VideoFormat.hls
-            : null,
+        formatHint: formatHint,
       );
       _controller = controller;
 
@@ -278,9 +285,9 @@ class _PlayerScreenState extends State<PlayerScreen>
         // Fail over promptly when a provider is dead so the next mirror can
         // start without making the viewer wait on a long network timeout.
         await controller.initialize().timeout(
-          const Duration(seconds: 6),
+          const Duration(seconds: 3),
           onTimeout: () {
-            throw Exception('Stream initialization timed out after 6s');
+            throw Exception('Stream initialization timed out after 3s');
           },
         );
         debugPrint('Stream source $index initialized successfully');
@@ -310,15 +317,9 @@ class _PlayerScreenState extends State<PlayerScreen>
         await controller.dispose();
         if (!mounted) return;
 
-        setState(() {
-          _loading = false;
-          _emptySource = false;
-          _error = null;
-          _isUnimplemented = true;
-          _sourceIndex = index;
-        });
-        _scheduleHide();
-        return;
+        // A bad/unsupported URL should not prevent trying the remaining
+        // mirrors. Only show an error after every candidate has failed.
+        continue;
       }
     }
 

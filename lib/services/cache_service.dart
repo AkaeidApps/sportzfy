@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:hive/hive.dart';
 
 import '../models/channel_model.dart';
+import 'fallback_streams.dart';
 
 /// A cached copy of the merged sports channel list.
 class CachedCatalog {
@@ -59,7 +60,28 @@ class CacheService {
       if (rawChannels is List) {
         for (final item in rawChannels) {
           if (item is Map) {
-            channels.add(Channel.fromJson(Map<String, dynamic>.from(item)));
+            final channel = Channel.fromJson(Map<String, dynamic>.from(item));
+            // Older app versions stored generic demo videos in the channel
+            // stream list. Strip them from cached catalogs too, otherwise an
+            // upgrade could keep opening a demo instead of that channel.
+            final oldUrls = channel.playbackUrls;
+            final realUrls = oldUrls
+                .where((url) => !FallbackStreams.contains(url))
+                .toList(growable: false);
+            final realHeaders = <Map<String, String>>[];
+            for (var i = 0; i < oldUrls.length; i++) {
+              if (FallbackStreams.contains(oldUrls[i])) continue;
+              if (i < channel.streamHeaders.length) {
+                realHeaders.add(channel.streamHeaders[i]);
+              }
+            }
+            channels.add(
+              channel.copyWith(
+                streamUrl: realUrls.isEmpty ? '' : realUrls.first,
+                streams: realUrls,
+                streamHeaders: realHeaders,
+              ),
+            );
           }
         }
       }

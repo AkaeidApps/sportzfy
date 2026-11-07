@@ -76,8 +76,20 @@ class ApiService {
   Future<RawCatalogData> fetchCatalog() async {
     final channelsFuture = fetchChannels().catchError((_) => <dynamic>[]);
     final streamsFuture = fetchStreams().catchError((_) => <dynamic>[]);
-    final logosFuture = fetchLogos().catchError((_) => <dynamic>[]);
-    final feedsFuture = fetchFeeds().catchError((_) => <dynamic>[]);
+    // Logos and feed metadata improve presentation/ranking, but should not
+    // keep the channel list waiting when those optional endpoints are slow.
+    final logosFuture = fetchLogos()
+        .timeout(
+          const Duration(seconds: 3),
+          onTimeout: () => <dynamic>[],
+        )
+        .catchError((_) => <dynamic>[]);
+    final feedsFuture = fetchFeeds()
+        .timeout(
+          const Duration(seconds: 3),
+          onTimeout: () => <dynamic>[],
+        )
+        .catchError((_) => <dynamic>[]);
 
     final results = await Future.wait<List<dynamic>>(<Future<List<dynamic>>>[
       channelsFuture,

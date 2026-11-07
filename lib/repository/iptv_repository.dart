@@ -7,7 +7,6 @@ import '../models/match_model.dart';
 import '../models/stream_model.dart';
 import '../services/api_service.dart';
 import '../services/cache_service.dart';
-import '../services/fallback_streams.dart';
 
 /// Result of loading the channel catalog.
 class CatalogResult {
@@ -167,11 +166,7 @@ class IptvRepository {
       final country = (json['country'] as String?)?.trim();
 
       final rankedUrls = _playbackUrls(ranked);
-      final streamUrl = rankedUrls.isNotEmpty ? rankedUrls.first : FallbackStreams.urls.first;
-      final allStreams = <String>[
-        ...rankedUrls,
-        ...FallbackStreams.urls,
-      ];
+      final streamUrl = rankedUrls.isNotEmpty ? rankedUrls.first : '';
 
       merged.add(
         Channel(
@@ -184,7 +179,7 @@ class IptvRepository {
           quality: ranked.isNotEmpty ? ranked.first.quality : 'HD',
           userAgent: ranked.isNotEmpty ? ranked.first.userAgent : null,
           referrer: ranked.isNotEmpty ? ranked.first.referrer : null,
-          streams: allStreams,
+          streams: rankedUrls,
           streamHeaders: _streamHeaders(ranked),
         ),
       );
@@ -269,7 +264,7 @@ class IptvRepository {
       final url = stream.url.trim();
       if (url.isEmpty || urls.contains(url)) continue;
       urls.add(url);
-      if (urls.length >= 6) break;
+      if (urls.length >= 2) break;
     }
     return urls;
   }
@@ -286,7 +281,7 @@ class IptvRepository {
         if ((stream.referrer ?? '').trim().isNotEmpty)
           'Referer': stream.referrer!.trim(),
       });
-      if (headers.length >= 6) break;
+      if (headers.length >= 2) break;
     }
     return headers;
   }
