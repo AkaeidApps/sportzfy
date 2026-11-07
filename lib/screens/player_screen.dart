@@ -10,6 +10,7 @@ import 'package:video_player/video_player.dart';
 import '../l10n/app_localizations.dart';
 import '../models/channel_model.dart';
 import '../models/match_model.dart';
+import '../services/fallback_streams.dart';
 import '../theme/app_colors.dart';
 
 /// Arguments required by the full-screen player.
@@ -126,6 +127,10 @@ class PlayerArgs {
       logoUrl: channel.logo,
       httpHeaders: headers,
       isLive: true,
+      // Every channel stays playable: when all real mirrors fail (offline,
+      // geo-blocked or expired providers) the player automatically walks the
+      // public backup clips instead of stopping on an error screen.
+      fallbackUrls: FallbackStreams.urls,
     );
   }
 
@@ -247,6 +252,21 @@ class _PlayerScreenState extends State<PlayerScreen>
   }
 
   Future<void> _initialize({int startIndex = 0}) async {
+    // On Linux/Windows desktop where video_player platform channel is not implemented,
+    // use the immersive simulated player directly to avoid UnimplementedError.
+    if (defaultTargetPlatform == TargetPlatform.linux ||
+        defaultTargetPlatform == TargetPlatform.windows) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _emptySource = false;
+        _error = null;
+        _isUnimplemented = true;
+      });
+      _scheduleHide();
+      return;
+    }
+
     await _disposeController();
     final sources = _sources;
     final firstIndex = startIndex
