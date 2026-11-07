@@ -252,6 +252,21 @@ class _PlayerScreenState extends State<PlayerScreen>
   }
 
   Future<void> _initialize({int startIndex = 0}) async {
+    // On Linux/Windows desktop where video_player platform channel is not implemented,
+    // use the immersive simulated player directly to avoid UnimplementedError.
+    if (defaultTargetPlatform == TargetPlatform.linux ||
+        defaultTargetPlatform == TargetPlatform.windows) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _emptySource = false;
+        _error = null;
+        _isUnimplemented = true;
+      });
+      _scheduleHide();
+      return;
+    }
+
     await _disposeController();
     final sources = _sources;
     final firstIndex = startIndex
