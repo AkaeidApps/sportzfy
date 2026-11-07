@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
@@ -17,6 +18,10 @@ import '../theme/app_colors.dart';
 /// the best-ranked source and walks through the rest automatically when one
 /// provider is down.
 class PlayerArgs {
+  static const String _browserUserAgent =
+      'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 '
+      '(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36';
+
   const PlayerArgs({
     required this.title,
     required this.streamUrl,
@@ -81,12 +86,18 @@ class PlayerArgs {
     if (isFallbackSource(index)) return const <String, String>{};
     // Each mirror can require different request headers. Do not leak the
     // primary mirror's Referer/User-Agent into a different provider.
-    if (index >= 0 && index < streamHeaders.length) {
-      return Map<String, String>.of(streamHeaders[index]);
+    final headers = index >= 0 && index < streamHeaders.length
+        ? Map<String, String>.of(streamHeaders[index])
+        : Map<String, String>.of(httpHeaders);
+    // Some providers accept a browser's request but reject ExoPlayer's
+    // default User-Agent. Preserve a catalog-supplied value when available.
+    final hasUserAgent = headers.keys.any(
+      (key) => key.toLowerCase() == 'user-agent',
+    );
+    if (!kIsWeb && !hasUserAgent) {
+      headers['User-Agent'] = _browserUserAgent;
     }
-    return <String, String>{
-      ...httpHeaders,
-    };
+    return headers;
   }
 
   factory PlayerArgs.fromChannel(
@@ -285,9 +296,11 @@ class _PlayerScreenState extends State<PlayerScreen>
         // Fail over promptly when a provider is dead so the next mirror can
         // start without making the viewer wait on a long network timeout.
         await controller.initialize().timeout(
-          const Duration(seconds: 3),
+          // Web HLS.js must fetch the playlist and an initial media segment;
+          // give that first source longer than the native low-latency path.
+          kIsWeb ? const Duration(seconds: 8) : const Duration(seconds: 3),
           onTimeout: () {
-            throw Exception('Stream initialization timed out after 3s');
+            throw Exception('Stream initialization timed out');
           },
         );
         debugPrint('Stream source $index initialized successfully');
@@ -316,6 +329,21 @@ class _PlayerScreenState extends State<PlayerScreen>
         _controller = null;
         await controller.dispose();
         if (!mounted) return;
+
+        final errString = error.toString();
+        if (errString.contains('UnimplementedError') ||
+            errString.contains('not been implemented') ||
+            errString.contains('MissingPluginException')) {
+          setState(() {
+            _loading = false;
+            _emptySource = false;
+            _error = null;
+            _isUnimplemented = true;
+            _sourceIndex = index;
+          });
+          _scheduleHide();
+          return;
+        }
 
         // A bad/unsupported URL should not prevent trying the remaining
         // mirrors. Only show an error after every candidate has failed.

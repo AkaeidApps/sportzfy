@@ -114,7 +114,7 @@ Requirements: Flutter 3.47+ / Dart 3.13+.
 
 - **Android**: Internet permission and `usesCleartextTraffic` are enabled because some public streams are HTTP.
 - **iOS/macOS**: ATS arbitrary loads and network-client entitlement are enabled for the same reason. Review these before shipping to a store.
-- **Web**: the UI builds and runs, but browsers without native HLS support (e.g. Chrome) cannot play every `.m3u8` stream. Use Android/iOS for real playback. Sample `.mp4` highlights work everywhere.
+- **Web**: HLS streams use `video_player_web_hls` with hls.js so browsers such as Chrome can play `.m3u8` sources. The stream host still needs to allow cross-origin requests (CORS).
 - The first channel load downloads the four API files; expect a few seconds on a slow connection.
 
 ---
