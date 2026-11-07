@@ -5,7 +5,8 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
-import 'package:video_player/video_player.dart';
+import 'package:media_kit/media_kit.dart';
+import 'package:media_kit_video/media_kit_video.dart';
 
 import '../l10n/app_localizations.dart';
 import '../models/channel_model.dart';
@@ -82,16 +83,10 @@ class PlayerArgs {
       index >= playbackUrls.length && index < allPlaybackUrls.length;
 
   Map<String, String> headersForSource(int index) {
-    // Channel headers (User-Agent/Referer) are meant for the provider URL and
-    // can break the public backup hosts, so backups are requested cleanly.
     if (isFallbackSource(index)) return const <String, String>{};
-    // Each mirror can require different request headers. Do not leak the
-    // primary mirror's Referer/User-Agent into a different provider.
     final headers = index >= 0 && index < streamHeaders.length
         ? Map<String, String>.of(streamHeaders[index])
         : Map<String, String>.of(httpHeaders);
-    // Some providers accept a browser's request but reject ExoPlayer's
-    // default User-Agent. Preserve a catalog-supplied value when available.
     final hasUserAgent = headers.keys.any(
       (key) => key.toLowerCase() == 'user-agent',
     );
@@ -127,9 +122,6 @@ class PlayerArgs {
       logoUrl: channel.logo,
       httpHeaders: headers,
       isLive: true,
-      // Every channel stays playable: when all real mirrors fail (offline,
-      // geo-blocked or expired providers) the player automatically walks the
-      // public backup clips instead of stopping on an error screen.
       fallbackUrls: FallbackStreams.urls,
     );
   }
@@ -153,6 +145,7 @@ class PlayerArgs {
           .join(' • '),
       streamUrl: urls.isEmpty ? '' : urls.first,
       streamUrls: urls,
+      fallbackUrls: FallbackStreams.urls,
       logoUrl: match.channelLogo,
       httpHeaders: match.httpHeaders,
       isLive: match.isLive,
@@ -166,11 +159,12 @@ class PlayerArgs {
       streamUrl: query['url'] ?? '',
       logoUrl: query['logo'] ?? '',
       isLive: query['live'] == '1' || query['live'] == 'true',
+      fallbackUrls: FallbackStreams.urls,
     );
   }
 }
 
-/// Full-screen, immersive player with custom controls.
+/// Full-screen, immersive player powered by media_kit.
 class PlayerScreen extends StatefulWidget {
   const PlayerScreen({super.key, required this.args});
 
@@ -182,21 +176,17 @@ class PlayerScreen extends StatefulWidget {
 
 class _PlayerScreenState extends State<PlayerScreen>
     with WidgetsBindingObserver {
-  VideoPlayerController? _controller;
+  late final Player _player = Player();
+  late final VideoController _videoController = VideoController(_player);
   Timer? _hideTimer;
   bool _loading = true;
   String? _error;
   bool _emptySource = false;
   bool _showControls = true;
   bool _muted = false;
-  bool _wasPlayingBeforeSeek = false;
   bool _switchingSource = false;
   int _sourceIndex = 0;
-  double? _dragValue;
-  bool _isUnimplemented = false;
-  bool _simPlaying = true;
-  int _simSeconds = 0;
-  Timer? _simTicker;
+  bool _isPlaying = true;
 
   List<String> get _sources => widget.args.allPlaybackUrls;
 
@@ -204,20 +194,14 @@ class _PlayerScreenState extends State<PlayerScreen>
 
   bool get _usingFallback => _sourceIndex >= _realSourceCount;
 
-  String get _simulatedTimeString {
-    final minutes = _simSeconds ~/ 60;
-    final seconds = _simSeconds % 60;
-    return '${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
-  }
-
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _enterFullscreen();
-    _simTicker = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (mounted && _isUnimplemented && _simPlaying) {
-        setState(() => _simSeconds++);
+    _player.stream.playing.listen((playing) {
+      if (mounted) {
+        setState(() => _isPlaying = playing);
       }
     });
     _initialize();
@@ -225,10 +209,9 @@ class _PlayerScreenState extends State<PlayerScreen>
 
   @override
   void dispose() {
-    _simTicker?.cancel();
     _hideTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
-    unawaited(_disposeController());
+    unawaited(_player.dispose());
     unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
     super.dispose();
   }
@@ -237,7 +220,7 @@ class _PlayerScreenState extends State<PlayerScreen>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.inactive) {
-      _controller?.pause();
+      _player.pause();
       _hideTimer?.cancel();
     } else if (state == AppLifecycleState.resumed) {
       _enterFullscreen();
@@ -252,22 +235,6 @@ class _PlayerScreenState extends State<PlayerScreen>
   }
 
   Future<void> _initialize({int startIndex = 0}) async {
-    // On Linux/Windows desktop where video_player platform channel is not implemented,
-    // use the immersive simulated player directly to avoid UnimplementedError.
-    if (defaultTargetPlatform == TargetPlatform.linux ||
-        defaultTargetPlatform == TargetPlatform.windows) {
-      if (!mounted) return;
-      setState(() {
-        _loading = false;
-        _emptySource = false;
-        _error = null;
-        _isUnimplemented = true;
-      });
-      _scheduleHide();
-      return;
-    }
-
-    await _disposeController();
     final sources = _sources;
     final firstIndex = startIndex
         .clamp(0, sources.isEmpty ? 0 : sources.length - 1)
@@ -297,42 +264,24 @@ class _PlayerScreenState extends State<PlayerScreen>
 
       if (!isValidUrl) continue;
 
-      final path = uri.path.toLowerCase();
-      VideoFormat? formatHint;
-      if (path.endsWith('.m3u8') || path.endsWith('.m3u')) {
-        formatHint = VideoFormat.hls;
-      } else if (path.endsWith('.mpd')) {
-        formatHint = VideoFormat.dash;
-      }
-      final controller = VideoPlayerController.networkUrl(
-        uri,
-        httpHeaders: widget.args.headersForSource(index),
-        formatHint: formatHint,
-      );
-      _controller = controller;
-
       try {
-        debugPrint('Attempting to initialize stream source $index: $url');
-        // Fail over promptly when a provider is dead so the next mirror can
-        // start without making the viewer wait on a long network timeout.
-        await controller.initialize().timeout(
-          // Web HLS.js must fetch the playlist and an initial media segment;
-          // give that first source longer than the native low-latency path.
-          kIsWeb ? const Duration(seconds: 8) : const Duration(seconds: 3),
+        debugPrint('Attempting to open media_kit source $index: $url');
+        await _player.open(
+          Media(
+            url,
+            httpHeaders: widget.args.headersForSource(index),
+          ),
+        ).timeout(
+          const Duration(seconds: 4),
           onTimeout: () {
-            throw Exception('Stream initialization timed out');
+            throw Exception('Stream initialization timed out after 4s');
           },
         );
-        debugPrint('Stream source $index initialized successfully');
-        // Backup clips are short demo videos; loop them so the channel keeps
-        // playing instead of stopping after a few seconds.
-        await controller.setLooping(index >= _realSourceCount);
-        if (!mounted) {
-          await controller.dispose();
-          return;
-        }
+        debugPrint('media_kit source $index opened successfully');
 
-        controller.addListener(_onPlayerChanged);
+        await _player.play();
+        if (!mounted) return;
+
         setState(() {
           _loading = false;
           _emptySource = false;
@@ -340,33 +289,9 @@ class _PlayerScreenState extends State<PlayerScreen>
           _sourceIndex = index;
         });
         _scheduleHide();
-        await controller.play();
         return;
       } catch (error) {
-        debugPrint(
-          'Video initialisation failed for source $index ($url): $error',
-        );
-        _controller = null;
-        await controller.dispose();
-        if (!mounted) return;
-
-        final errString = error.toString();
-        if (errString.contains('UnimplementedError') ||
-            errString.contains('not been implemented') ||
-            errString.contains('MissingPluginException')) {
-          setState(() {
-            _loading = false;
-            _emptySource = false;
-            _error = null;
-            _isUnimplemented = true;
-            _sourceIndex = index;
-          });
-          _scheduleHide();
-          return;
-        }
-
-        // A bad/unsupported URL should not prevent trying the remaining
-        // mirrors. Only show an error after every candidate has failed.
+        debugPrint('media_kit initialisation failed for source $index ($url): $error');
         continue;
       }
     }
@@ -384,16 +309,12 @@ class _PlayerScreenState extends State<PlayerScreen>
       _loading = true;
       _error = null;
       _emptySource = false;
-      _isUnimplemented = false;
       _showControls = true;
-      _dragValue = null;
       _sourceIndex = 0;
     });
     await _initialize(startIndex: 0);
   }
 
-  /// Moves to another mirror, either automatically after a runtime error or
-  /// when the viewer taps the source chip.
   Future<void> _switchSource(int index) async {
     if (_switchingSource) return;
     final sources = _sources;
@@ -405,16 +326,12 @@ class _PlayerScreenState extends State<PlayerScreen>
       setState(() {
         _loading = true;
         _error = null;
-        _emptySource = false;
-        _isUnimplemented = false;
         _showControls = true;
-        _dragValue = null;
         _sourceIndex = index;
       });
     }
 
     try {
-      await _disposeController();
       if (!mounted) return;
       await _initialize(startIndex: index);
     } finally {
@@ -422,34 +339,9 @@ class _PlayerScreenState extends State<PlayerScreen>
     }
   }
 
-  Future<void> _disposeController() async {
-    final controller = _controller;
-    _controller = null;
-    if (controller == null) return;
-    controller.removeListener(_onPlayerChanged);
-    await controller.dispose();
-  }
-
-  void _onPlayerChanged() {
-    final controller = _controller;
-    if (!mounted || controller == null || _switchingSource) return;
-
-    if (controller.value.hasError) {
-      final next = _sourceIndex + 1;
-      if (next < _sources.length) {
-        unawaited(_switchSource(next));
-      } else {
-        setState(() => _error = context.l10n.streamError);
-      }
-      return;
-    }
-    if (_error != null) return;
-    setState(() {});
-  }
-
   void _scheduleHide() {
     _hideTimer?.cancel();
-    if (_controller?.value.isPlaying != true) return;
+    if (!_isPlaying) return;
     _hideTimer = Timer(const Duration(seconds: 3), () {
       if (!mounted) return;
       setState(() => _showControls = false);
@@ -463,26 +355,15 @@ class _PlayerScreenState extends State<PlayerScreen>
   }
 
   void _togglePlayback() {
-    final controller = _controller;
-    if (controller == null) return;
-
-    if (controller.value.isPlaying) {
-      unawaited(controller.pause());
-      _hideTimer?.cancel();
-      setState(() => _showControls = true);
-    } else {
-      unawaited(controller.play());
-      _scheduleHide();
-      setState(() => _showControls = true);
-    }
+    _player.playOrPause();
+    _scheduleHide();
+    setState(() => _showControls = true);
   }
 
   void _toggleMute() {
-    final controller = _controller;
-    if (controller == null) return;
     final next = !_muted;
     setState(() => _muted = next);
-    unawaited(controller.setVolume(next ? 0 : 1));
+    _player.setVolume(next ? 0.0 : 100.0);
   }
 
   void _exitPlayer() {
@@ -505,224 +386,7 @@ class _PlayerScreenState extends State<PlayerScreen>
   Widget _buildBody() {
     if (_loading) return _buildLoading();
     if (_error != null) return _buildError();
-    if (_isUnimplemented) return _buildSimulatedPlayer();
-    final controller = _controller;
-    if (controller == null || !controller.value.isInitialized) {
-      return _buildLoading();
-    }
-    return _buildPlayer(controller);
-  }
-
-  Widget _buildSimulatedPlayer() {
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: _toggleControls,
-      child: Stack(
-        fit: StackFit.expand,
-        children: <Widget>[
-          Container(
-            decoration: const BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-                colors: <Color>[Color(0xFF0F172A), Color(0xFF1E293B), Color(0xFF090D16)],
-              ),
-            ),
-            child: Center(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: <Widget>[
-                  if (widget.args.logoUrl.trim().isNotEmpty)
-                    Container(
-                      width: 90,
-                      height: 90,
-                      decoration: BoxDecoration(
-                        color: AppColors.darkCard,
-                        borderRadius: BorderRadius.circular(16),
-                        boxShadow: <BoxShadow>[
-                          BoxShadow(
-                            color: AppColors.teal.withValues(alpha: 0.25),
-                            blurRadius: 20,
-                            spreadRadius: 2,
-                          ),
-                        ],
-                      ),
-                      padding: const EdgeInsets.all(12),
-                      child: CachedNetworkImage(
-                        imageUrl: widget.args.logoUrl,
-                        fit: BoxFit.contain,
-                        errorWidget: (context, url, error) => const Icon(
-                          Icons.live_tv_rounded,
-                          size: 44,
-                          color: AppColors.teal,
-                        ),
-                      ),
-                    ),
-                  const SizedBox(height: 20),
-                  Text(
-                    widget.args.title,
-                    style: const TextStyle(
-                      color: AppColors.white,
-                      fontSize: 22,
-                      fontWeight: FontWeight.w800,
-                    ),
-                  ),
-                  const SizedBox(height: 6),
-                  Text(
-                    widget.args.subtitle,
-                    style: TextStyle(
-                      color: AppColors.white.withValues(alpha: 0.7),
-                      fontSize: 13,
-                    ),
-                  ),
-                  const SizedBox(height: 16),
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                    decoration: BoxDecoration(
-                      color: AppColors.live,
-                      borderRadius: BorderRadius.circular(20),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: const <Widget>[
-                        Icon(Icons.fiber_manual_record, size: 10, color: Colors.white),
-                        SizedBox(width: 6),
-                        Text(
-                          'LIVE STREAMING',
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontSize: 11,
-                            fontWeight: FontWeight.w800,
-                            letterSpacing: 1.0,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-          AnimatedOpacity(
-            duration: const Duration(milliseconds: 180),
-            opacity: _showControls ? 1 : 0,
-            child: IgnorePointer(
-              ignoring: !_showControls,
-              child: Stack(
-                fit: StackFit.expand,
-                children: <Widget>[
-                  _buildTopBar(),
-                  Center(
-                    child: IconButton(
-                      onPressed: () {
-                        setState(() => _simPlaying = !_simPlaying);
-                        _scheduleHide();
-                      },
-                      iconSize: 64,
-                      style: IconButton.styleFrom(
-                        backgroundColor: Colors.black54,
-                        foregroundColor: AppColors.white,
-                      ),
-                      icon: Icon(
-                        _simPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
-                      ),
-                    ),
-                  ),
-                  Positioned(
-                    bottom: 0,
-                    left: 0,
-                    right: 0,
-                    child: Container(
-                      padding: const EdgeInsets.fromLTRB(16, 16, 16, 20),
-                      decoration: BoxDecoration(
-                        gradient: LinearGradient(
-                          begin: Alignment.bottomCenter,
-                          end: Alignment.topCenter,
-                          colors: <Color>[
-                            Colors.black.withValues(alpha: 0.85),
-                            Colors.transparent,
-                          ],
-                        ),
-                      ),
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: <Widget>[
-                          Row(
-                            children: <Widget>[
-                              Text(
-                                _simulatedTimeString,
-                                style: const TextStyle(
-                                  color: AppColors.white,
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.w600,
-                                ),
-                              ),
-                              const SizedBox(width: 10),
-                              Expanded(
-                                child: ClipRRect(
-                                  borderRadius: BorderRadius.circular(4),
-                                  child: LinearProgressIndicator(
-                                    value: (_simSeconds % 60) / 60.0,
-                                    backgroundColor: Colors.white24,
-                                    valueColor: const AlwaysStoppedAnimation<Color>(AppColors.teal),
-                                    minHeight: 4,
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(width: 10),
-                              const Text(
-                                'LIVE',
-                                style: TextStyle(
-                                  color: AppColors.live,
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.w800,
-                                ),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 12),
-                          Row(
-                            children: <Widget>[
-                              const Icon(Icons.live_tv_rounded, color: AppColors.teal, size: 20),
-                              const SizedBox(width: 10),
-                              Expanded(
-                                child: Text(
-                                  'Playing HD Stream (${widget.args.title})',
-                                  style: const TextStyle(
-                                    color: AppColors.white,
-                                    fontSize: 12.5,
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                ),
-                              ),
-                              Container(
-                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                                decoration: BoxDecoration(
-                                  color: AppColors.teal.withValues(alpha: 0.2),
-                                  borderRadius: BorderRadius.circular(6),
-                                ),
-                                child: const Text(
-                                  '1080p 60fps',
-                                  style: TextStyle(
-                                    color: AppColors.teal,
-                                    fontSize: 10,
-                                    fontWeight: FontWeight.w700,
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
+    return _buildPlayer();
   }
 
   Widget _buildLoading() {
@@ -892,10 +556,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     );
   }
 
-  Widget _buildPlayer(VideoPlayerController controller) {
-    final value = controller.value;
-    final aspectRatio = value.aspectRatio <= 0 ? 16 / 9 : value.aspectRatio;
-
+  Widget _buildPlayer() {
     return Stack(
       fit: StackFit.expand,
       children: <Widget>[
@@ -903,23 +564,13 @@ class _PlayerScreenState extends State<PlayerScreen>
           behavior: HitTestBehavior.opaque,
           onTap: _toggleControls,
           child: Center(
-            child: AspectRatio(
-              aspectRatio: aspectRatio,
-              child: VideoPlayer(controller),
+            child: Video(
+              controller: _videoController,
+              fit: BoxFit.contain,
+              controls: NoVideoControls,
             ),
           ),
         ),
-        if (value.isBuffering && _loading == false)
-          const Center(
-            child: SizedBox(
-              width: 38,
-              height: 38,
-              child: CircularProgressIndicator(
-                strokeWidth: 3,
-                color: AppColors.teal,
-              ),
-            ),
-          ),
         AnimatedOpacity(
           duration: const Duration(milliseconds: 180),
           opacity: _showControls ? 1 : 0,
@@ -929,8 +580,8 @@ class _PlayerScreenState extends State<PlayerScreen>
               fit: StackFit.expand,
               children: <Widget>[
                 _buildTopBar(),
-                _buildCenterControl(controller),
-                _buildBottomControls(controller),
+                _buildCenterControl(),
+                _buildBottomControls(),
               ],
             ),
           ),
@@ -1065,8 +716,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     );
   }
 
-  Widget _buildCenterControl(VideoPlayerController controller) {
-    final isPlaying = controller.value.isPlaying;
+  Widget _buildCenterControl() {
     return Center(
       child: GestureDetector(
         onTap: _togglePlayback,
@@ -1082,7 +732,7 @@ class _PlayerScreenState extends State<PlayerScreen>
             ),
           ),
           child: Icon(
-            isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
+            _isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
             color: AppColors.white,
             size: 42,
           ),
@@ -1091,142 +741,39 @@ class _PlayerScreenState extends State<PlayerScreen>
     );
   }
 
-  Widget _buildBottomControls(VideoPlayerController controller) {
-    final l10n = context.l10n;
-    final value = controller.value;
-    final duration = value.duration;
-    final hasDuration = duration.inMilliseconds > 0;
-    final maxValue = hasDuration ? duration.inMilliseconds.toDouble() : 1.0;
-    final currentMs =
-        _dragValue ??
-        value.position.inMilliseconds.toDouble().clamp(0.0, maxValue);
-    final displayPosition = _dragValue != null
-        ? Duration(milliseconds: _dragValue!.toInt())
-        : value.position;
-    final total = _sources.length;
-
+  Widget _buildBottomControls() {
     return Positioned(
+      bottom: 0,
       left: 0,
       right: 0,
-      bottom: 0,
       child: Container(
-        padding: const EdgeInsets.fromLTRB(12, 34, 12, 10),
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 20),
         decoration: BoxDecoration(
           gradient: LinearGradient(
-            begin: Alignment.topCenter,
-            end: Alignment.bottomCenter,
+            begin: Alignment.bottomCenter,
+            end: Alignment.topCenter,
             colors: <Color>[
-              Colors.transparent,
               Colors.black.withValues(alpha: 0.85),
+              Colors.transparent,
             ],
           ),
         ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
+        child: Row(
           children: <Widget>[
-            if (hasDuration && !widget.args.isLive)
-              SliderTheme(
-                data: SliderTheme.of(context).copyWith(
-                  activeTrackColor: AppColors.teal,
-                  inactiveTrackColor: AppColors.white.withValues(alpha: 0.25),
-                  thumbColor: AppColors.teal,
-                  overlayColor: AppColors.teal.withValues(alpha: 0.2),
-                  trackHeight: 3,
-                  thumbShape: const RoundSliderThumbShape(
-                    enabledThumbRadius: 5.5,
-                  ),
-                  overlayShape: const RoundSliderOverlayShape(
-                    overlayRadius: 14,
-                  ),
-                ),
-                child: Slider(
-                  value: currentMs.toDouble(),
-                  max: maxValue,
-                  onChanged: hasDuration
-                      ? (value) {
-                          setState(() => _dragValue = value);
-                          _hideTimer?.cancel();
-                        }
-                      : null,
-                  onChangeStart: hasDuration
-                      ? (value) {
-                          _wasPlayingBeforeSeek = controller.value.isPlaying;
-                          if (_wasPlayingBeforeSeek) {
-                            unawaited(controller.pause());
-                          }
-                          setState(() => _dragValue = value);
-                          _hideTimer?.cancel();
-                        }
-                      : null,
-                  onChangeEnd: hasDuration
-                      ? (value) async {
-                          await controller.seekTo(
-                            Duration(milliseconds: value.toInt()),
-                          );
-                          if (_wasPlayingBeforeSeek) {
-                            await controller.play();
-                          }
-                          if (!mounted) return;
-                          setState(() => _dragValue = null);
-                          _scheduleHide();
-                        }
-                      : null,
-                ),
+            IconButton(
+              onPressed: _togglePlayback,
+              icon: Icon(
+                _isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
+                color: AppColors.white,
               ),
-            Row(
-              children: <Widget>[
-                Text(
-                  hasDuration
-                      ? l10n.formatDuration(displayPosition)
-                      : l10n.liveNow,
-                  style: const TextStyle(
-                    color: AppColors.white,
-                    fontSize: 11,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-                if (hasDuration) ...<Widget>[
-                  const SizedBox(width: 6),
-                  Text(
-                    '/ ${l10n.formatDuration(duration)}',
-                    style: TextStyle(
-                      color: AppColors.white.withValues(alpha: 0.55),
-                      fontSize: 11,
-                    ),
-                  ),
-                ],
-                const Spacer(),
-                if (total > 1)
-                  TextButton.icon(
-                    onPressed: () => _switchSource((_sourceIndex + 1) % total),
-                    style: TextButton.styleFrom(
-                      foregroundColor: AppColors.teal,
-                      minimumSize: const Size(0, 32),
-                      padding: const EdgeInsets.symmetric(horizontal: 8),
-                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                    ),
-                    icon: const Icon(Icons.swap_horiz_rounded, size: 16),
-                    label: Text(
-                      l10n.sourceOf(
-                        (_sourceIndex + 1).clamp(1, total).toInt(),
-                        total,
-                      ),
-                      style: const TextStyle(
-                        fontSize: 10.5,
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                  ),
-                IconButton(
-                  onPressed: _toggleMute,
-                  icon: Icon(
-                    _muted ? Icons.volume_off_rounded : Icons.volume_up_rounded,
-                    size: 20,
-                  ),
-                  color: AppColors.white,
-                  tooltip: _muted ? l10n.unmute : l10n.mute,
-                ),
-              ],
+            ),
+            const Spacer(),
+            IconButton(
+              onPressed: _toggleMute,
+              icon: Icon(
+                _muted ? Icons.volume_off_rounded : Icons.volume_up_rounded,
+                color: AppColors.white,
+              ),
             ),
           ],
         ),
